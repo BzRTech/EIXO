@@ -1,0 +1,208 @@
+# ============================================================
+# WebGIS Stack - Menor Custo Possível
+# Stack: PostGIS + Martin + Varnish + PgBouncer + Caddy
+# Infra: Vultr São Paulo 4vCPU/8GB = ~R$126/mês
+# CDN: Cloudflare Free (em frente ao Caddy)
+# ============================================================
+
+version: "3.9"
+
+networks:
+  webgis_net:
+    driver: bridge
+
+volumes:
+  postgis_data:
+    driver: local
+  varnish_storage:
+    driver: local
+  caddy_data:
+    driver: local
+  caddy_config:
+    driver: local
+  uptime_kuma_data:
+    driver: local
+
+services:
+
+  # ──────────────────────────────────────────────
+  # 1. BANCO DE DADOS: PostgreSQL 16 + PostGIS 3.6
+  # ──────────────────────────────────────────────
+  postgis:
+    image: postgis/postgis:16-3.4
+    container_name: webgis_postgis
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-webgis}
+      POSTGRES_USER: ${POSTGRES_USER:-webgis}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD no .env}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgis_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
+    networks:
+      - webgis_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-webgis} -d ${POSTGRES_DB:-webgis}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Não expor porta ao mundo — apenas via PgBouncer internamente
+    expose:
+      - "5432"
+
+  # ──────────────────────────────────────────────
+  # 2. CONNECTION POOLING: PgBouncer
+  # transaction mode, default_pool_size=30
+  # Reduz 5-10MB/conexão para pool compartilhado
+  # ──────────────────────────────────────────────
+  pgbouncer:
+    image: bitnami/pgbouncer:1.22.1
+    container_name: webgis_pgbouncer
+    restart: unless-stopped
+    environment:
+      POSTGRESQL_HOST: postgis
+      POSTGRESQL_PORT: 5432
+      POSTGRESQL_DATABASE: ${POSTGRES_DB:-webgis}
+      POSTGRESQL_USERNAME: ${POSTGRES_USER:-webgis}
+      POSTGRESQL_PASSWORD: ${POSTGRES_PASSWORD}
+      PGBOUNCER_DATABASE: ${POSTGRES_DB:-webgis}
+      PGBOUNCER_POOL_MODE: transaction
+      PGBOUNCER_DEFAULT_POOL_SIZE: 30
+      PGBOUNCER_MAX_CLIENT_CONN: 200
+      PGBOUNCER_MIN_POOL_SIZE: 5
+      PGBOUNCER_RESERVE_POOL_SIZE: 10
+      PGBOUNCER_IGNORE_STARTUP_PARAMETERS: extra_float_digits
+    networks:
+      - webgis_net
+    depends_on:
+      postgis:
+        condition: service_healthy
+    expose:
+      - "5432"
+
+  # ──────────────────────────────────────────────
+  # 3. TILE SERVER: Martin (Rust, MapLibre project)
+  # Melhor performance bruta, suporte nativo a PMTiles/MBTiles
+  # Gera vector tiles via ST_AsMVT() direto do PostGIS
+  # ──────────────────────────────────────────────
+  martin:
+    image: ghcr.io/maplibre/martin:v0.14.3
+    container_name: webgis_martin
+    restart: unless-stopped
+    environment:
+      # Conecta via PgBouncer para connection pooling
+      DATABASE_URL: postgresql://${POSTGRES_USER:-webgis}:${POSTGRES_PASSWORD}@pgbouncer:5432/${POSTGRES_DB:-webgis}
+    volumes:
+      - ./martin/config.yaml:/config.yaml:ro
+    command: --config /config.yaml
+    networks:
+      - webgis_net
+    depends_on:
+      - pgbouncer
+    expose:
+      - "3000"
+
+  # ──────────────────────────────────────────────
+  # 4. TILE CACHE: Varnish
+  # TTL de 60s reduz uso de CPU "quase a zero" (Crunchy Data)
+  # Pré-cache de zoom 0-12, dinâmico em 13+
+  # ──────────────────────────────────────────────
+  varnish:
+    image: varnish:7.5
+    container_name: webgis_varnish
+    restart: unless-stopped
+    volumes:
+      - ./varnish/default.vcl:/etc/varnish/default.vcl:ro
+    environment:
+      VARNISH_SIZE: 512m
+    command: -F -f /etc/varnish/default.vcl -s malloc,512m -p thread_pool_min=50 -p thread_pool_max=1000
+    networks:
+      - webgis_net
+    depends_on:
+      - martin
+    expose:
+      - "80"
+
+  # ──────────────────────────────────────────────
+  # 5. APP / API: Backend da aplicação WebGIS
+  # Substitua pela sua imagem real
+  # ──────────────────────────────────────────────
+  app:
+    image: ${APP_IMAGE:-nginx:alpine}
+    container_name: webgis_app
+    restart: unless-stopped
+    volumes:
+      - ./app:/usr/share/nginx/html:ro
+    networks:
+      - webgis_net
+    depends_on:
+      - pgbouncer
+    expose:
+      - "80"
+
+  # ──────────────────────────────────────────────
+  # 6. REVERSE PROXY: Caddy
+  # HTTPS automático via Let's Encrypt/ZeroSSL
+  # Substitui Nginx — config em 3 linhas por serviço
+  # ──────────────────────────────────────────────
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: webgis_caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"  # HTTP/3
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - webgis_net
+    depends_on:
+      - app
+      - varnish
+
+  # ──────────────────────────────────────────────
+  # 7. MONITORAMENTO: Uptime Kuma
+  # Availability monitoring sem custo de software
+  # ──────────────────────────────────────────────
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: webgis_uptime_kuma
+    restart: unless-stopped
+    volumes:
+      - uptime_kuma_data:/app/data
+    networks:
+      - webgis_net
+    expose:
+      - "3001"
+
+  # ──────────────────────────────────────────────
+  # 8. MÉTRICAS: Netdata
+  # Métricas de infraestrutura em tempo real (~200MB RAM)
+  # ──────────────────────────────────────────────
+  netdata:
+    image: netdata/netdata:stable
+    container_name: webgis_netdata
+    restart: unless-stopped
+    pid: host
+    cap_add:
+      - SYS_PTRACE
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      NETDATA_CLAIM_TOKEN: ${NETDATA_CLAIM_TOKEN:-}
+      NETDATA_CLAIM_URL: https://app.netdata.cloud
+    networks:
+      - webgis_net
+    expose:
+      - "19999"

@@ -1,0 +1,29 @@
+# Segredos — NUNCA commitar
+.env
+*.key
+*.pem
+*.crt
+
+# Dados persistentes
+postgres/data/
+caddy/data/
+caddy/config/
+
+# Backups locais
+/tmp/webgis-backup/
+*.sql.gz
+*.dump
+
+# Node / frontend build
+app/node_modules/
+app/dist/
+app/.next/
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+
+# Logs
+*.log
+logs/

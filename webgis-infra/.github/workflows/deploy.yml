@@ -1,0 +1,182 @@
+# ============================================================
+# GitHub Actions — CI/CD WebGIS
+# Custo: ZERO (plano Free: 2.000 min/mês para repos privados)
+# Uma pipeline típica consome 5-8 min → ~600-1440 min/mês com 4-6 deploys/dia
+# GitHub Container Registry (GHCR): storage gratuito para imagens Docker
+# ============================================================
+
+name: Deploy WebGIS
+
+on:
+  push:
+    branches:
+      - main        # Deploy automático em push para main
+  pull_request:
+    branches:
+      - main        # Build + testes em PRs (sem deploy)
+  workflow_dispatch:  # Deploy manual pela interface GitHub
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/webgis-app
+
+jobs:
+  # ────────────────────────────────────────────────────────
+  # JOB 1: Build e testes
+  # ────────────────────────────────────────────────────────
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js (para build do frontend)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: 'app/package-lock.json'
+
+      # Instalar dependências e buildar o frontend (Vite/React)
+      - name: Build frontend
+        working-directory: ./app
+        run: |
+          npm ci
+          npm run build
+          npm test -- --passWithNoTests
+        continue-on-error: false
+
+      # Login no GitHub Container Registry (gratuito)
+      - name: Login no GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Metadata para tags da imagem
+      - name: Extrair metadata Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix=,suffix=,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # Build multi-plataforma + push para GHCR
+      - name: Build e push imagem Docker
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha          # Cache de layers do GitHub Actions
+          cache-to: type=gha,mode=max
+
+  # ────────────────────────────────────────────────────────
+  # JOB 2: Deploy via SSH (só em push para main)
+  # ────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy para Produção
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+
+    environment:
+      name: production
+      url: https://${{ secrets.DOMAIN }}
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      # Deploy via SSH no Vultr São Paulo
+      - name: Deploy no servidor
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          timeout: 300s
+          script: |
+            set -e
+            cd /opt/webgis
+
+            echo "🔄 Atualizando código..."
+            git pull origin main
+
+            echo "🔐 Login no GHCR..."
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            echo "📦 Atualizando imagem da aplicação..."
+            export APP_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+            docker pull "$APP_IMAGE"
+
+            echo "🚀 Reiniciando serviços..."
+            docker compose pull app
+            docker compose up -d --no-deps --force-recreate app
+
+            echo "⏳ Aguardando health check..."
+            sleep 10
+            docker compose ps
+
+            echo "✅ Deploy concluído!"
+
+      # Verifica se o site está respondendo
+      - name: Smoke test
+        run: |
+          sleep 15
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://${{ secrets.DOMAIN }}/health" || echo "000")
+          echo "Status HTTP: ${HTTP_STATUS}"
+          if [[ "$HTTP_STATUS" != "200" ]]; then
+            echo "❌ Smoke test falhou! Status: ${HTTP_STATUS}"
+            exit 1
+          fi
+          echo "✅ Smoke test passou!"
+
+  # ────────────────────────────────────────────────────────
+  # JOB 3: Refresh do cache de tiles (pós-deploy)
+  # ────────────────────────────────────────────────────────
+  refresh-tiles:
+    name: Refresh tile cache
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    timeout-minutes: 5
+
+    steps:
+      - name: Purge Varnish cache
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            # Purga o cache do Varnish após deploy
+            docker exec webgis_varnish varnishadm "ban req.url ~ ^/tiles/" 2>/dev/null || true
+            echo "✅ Cache de tiles purgado"
+
+      - name: Purge Cloudflare cache
+        if: ${{ secrets.CF_ZONE_ID != '' }}
+        run: |
+          curl -s -X POST \
+            "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/purge_cache" \
+            -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"purge_everything":true}' \
+          | python3 -c "import sys,json; r=json.load(sys.stdin); print('✅ Cloudflare cache purgado' if r['success'] else '❌ Erro: ' + str(r['errors']))"

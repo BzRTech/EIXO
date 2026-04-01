@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebGIS</title>
+
+    <!-- MapLibre GL JS v5.x — Frontend recomendado para WebGIS em 2026 -->
+    <!-- Rendering WebGL GPU-acelerado, suporte nativo MVT + PMTiles -->
+    <!-- 1,3M downloads semanais no npm; backed por Amazon, Meta, Microsoft -->
+    <link href="https://unpkg.com/maplibre-gl@4.7.0/dist/maplibre-gl.css" rel="stylesheet">
+    <script src="https://unpkg.com/maplibre-gl@4.7.0/dist/maplibre-gl.js"></script>
+
+    <!-- PMTiles — elimina necessidade de tile server para dados estáticos -->
+    <script src="https://unpkg.com/pmtiles@3.0.7/dist/pmtiles.js"></script>
+
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #1a1a2e;
+            color: #e0e0e0;
+        }
+
+        /* ── Layout principal ── */
+        #app {
+            display: grid;
+            grid-template-rows: 56px 1fr;
+            height: 100vh;
+        }
+
+        /* ── Navbar ── */
+        nav {
+            background: #16213e;
+            border-bottom: 1px solid #0f3460;
+            display: flex;
+            align-items: center;
+            padding: 0 16px;
+            gap: 16px;
+            z-index: 100;
+        }
+
+        nav h1 {
+            font-size: 18px;
+            font-weight: 600;
+            color: #e94560;
+            letter-spacing: 0.5px;
+        }
+
+        nav .badge {
+            font-size: 11px;
+            background: #0f3460;
+            color: #53d8fb;
+            padding: 2px 8px;
+            border-radius: 12px;
+        }
+
+        /* ── Container do mapa ── */
+        #map-container {
+            position: relative;
+            overflow: hidden;
+        }
+
+        #map {
+            width: 100%;
+            height: 100%;
+        }
+
+        /* ── Painel lateral ── */
+        #sidebar {
+            position: absolute;
+            top: 12px;
+            left: 12px;
+            width: 280px;
+            background: rgba(22, 33, 62, 0.95);
+            backdrop-filter: blur(8px);
+            border: 1px solid #0f3460;
+            border-radius: 8px;
+            padding: 16px;
+            z-index: 10;
+            max-height: calc(100vh - 80px);
+            overflow-y: auto;
+        }
+
+        #sidebar h2 {
+            font-size: 13px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #53d8fb;
+            margin-bottom: 12px;
+        }
+
+        /* ── Controles de camadas ── */
+        .layer-control {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #0f3460;
+        }
+
+        .layer-control:last-child { border-bottom: none; }
+
+        .layer-control label {
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: pointer;
+        }
+
+        .layer-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+        }
+
+        /* Toggle switch */
+        .toggle {
+            position: relative;
+            width: 36px;
+            height: 20px;
+        }
+
+        .toggle input { opacity: 0; width: 0; height: 0; }
+
+        .toggle-slider {
+            position: absolute;
+            cursor: pointer;
+            inset: 0;
+            background: #0f3460;
+            border-radius: 20px;
+            transition: .3s;
+        }
+
+        .toggle-slider:before {
+            content: "";
+            position: absolute;
+            height: 14px;
+            width: 14px;
+            left: 3px;
+            bottom: 3px;
+            background: white;
+            border-radius: 50%;
+            transition: .3s;
+        }
+
+        input:checked + .toggle-slider { background: #e94560; }
+        input:checked + .toggle-slider:before { transform: translateX(16px); }
+
+        /* ── Stats ── */
+        #stats {
+            position: absolute;
+            bottom: 32px;
+            left: 12px;
+            background: rgba(22, 33, 62, 0.9);
+            border: 1px solid #0f3460;
+            border-radius: 6px;
+            padding: 8px 12px;
+            font-size: 11px;
+            color: #888;
+            z-index: 10;
+        }
+
+        #stats span { color: #53d8fb; font-weight: 600; }
+
+        /* ── Popup ── */
+        .maplibregl-popup-content {
+            background: #16213e !important;
+            border: 1px solid #0f3460 !important;
+            color: #e0e0e0 !important;
+            border-radius: 8px !important;
+            padding: 12px !important;
+            font-size: 13px !important;
+            min-width: 180px;
+        }
+
+        .maplibregl-popup-content h3 {
+            color: #53d8fb;
+            margin-bottom: 6px;
+            font-size: 14px;
+        }
+
+        .maplibregl-popup-content table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .maplibregl-popup-content td {
+            padding: 2px 4px;
+        }
+
+        .maplibregl-popup-content td:first-child {
+            color: #888;
+            font-size: 11px;
+        }
+
+        .maplibregl-popup-tip { border-top-color: #0f3460 !important; }
+        .maplibregl-popup-close-button { color: #888 !important; }
+
+        /* ── Loading ── */
+        #loading {
+            position: absolute;
+            inset: 0;
+            background: #1a1a2e;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 50;
+            transition: opacity 0.5s;
+        }
+
+        #loading.hidden { opacity: 0; pointer-events: none; }
+
+        .spinner {
+            width: 40px;
+            height: 40px;
+            border: 3px solid #0f3460;
+            border-top-color: #e94560;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-bottom: 12px;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        #loading p { color: #888; font-size: 13px; }
+    </style>
+</head>
+
+<body>
+<div id="app">
+
+    <!-- Navbar -->
+    <nav>
+        <h1>⬡ WebGIS</h1>
+        <span class="badge">PostGIS + MapLibre</span>
+        <span class="badge" id="zoom-badge">Zoom: 5</span>
+    </nav>
+
+    <!-- Mapa -->
+    <div id="map-container">
+
+        <!-- Loading overlay -->
+        <div id="loading">
+            <div class="spinner"></div>
+            <p>Carregando mapa...</p>
+        </div>
+
+        <!-- Mapa principal -->
+        <div id="map"></div>
+
+        <!-- Painel de camadas -->
+        <div id="sidebar">
+            <h2>Camadas</h2>
+
+            <div class="layer-control">
+                <label>
+                    <span class="layer-dot" style="background:#e94560"></span>
+                    Features
+                </label>
+                <label class="toggle">
+                    <input type="checkbox" id="toggle-features" checked>
+                    <span class="toggle-slider"></span>
+                </label>
+            </div>
+
+            <div class="layer-control">
+                <label>
+                    <span class="layer-dot" style="background:#53d8fb"></span>
+                    Tiles Cache
+                </label>
+                <label class="toggle">
+                    <input type="checkbox" id="toggle-cache">
+                    <span class="toggle-slider"></span>
+                </label>
+            </div>
+        </div>
+
+        <!-- Stats -->
+        <div id="stats">
+            Features visíveis: <span id="feature-count">—</span> |
+            Cache: <span id="cache-status">—</span>
+        </div>
+
+    </div>
+</div>
+
+<script>
+// ── Configuração PMTiles (dados estáticos sem tile server) ──
+// Registra o protocolo PMTiles no MapLibre
+const protocol = new pmtiles.Protocol();
+maplibregl.addProtocol('pmtiles', protocol.tile);
+
+// ── Inicialização do mapa ──────────────────────────────────
+const TILE_SERVER = window.location.origin + '/tiles';  // Via Caddy → Varnish → Martin
+
+const map = new maplibregl.Map({
+    container: 'map',
+    // Basemap gratuito (MapTiler Community — sem custos para uso básico)
+    // Substitua por PMTiles local para custo ZERO
+    style: {
+        version: 8,
+        glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
+        sources: {
+            'osm': {
+                type: 'raster',
+                tiles: [
+                    'https://tile.openstreetmap.org/{z}/{x}/{y}.png'
+                ],
+                tileSize: 256,
+                attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+                maxzoom: 19
+            }
+        },
+        layers: [{
+            id: 'osm-base',
+            type: 'raster',
+            source: 'osm',
+            paint: { 'raster-opacity': 0.85 }
+        }]
+    },
+    center: [-47.9292, -15.7801],  // Brasil — Brasília
+    zoom: 4,
+    minZoom: 2,
+    maxZoom: 18,
+    attributionControl: false
+});
+
+// ── Controles do mapa ──────────────────────────────────────
+map.addControl(new maplibregl.NavigationControl(), 'bottom-right');
+map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-right');
+map.addControl(new maplibregl.FullscreenControl(), 'bottom-right');
+map.addControl(new maplibregl.GeolocateControl({
+    positionOptions: { enableHighAccuracy: true },
+    trackUserLocation: true
+}), 'bottom-right');
+map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-left');
+
+// ── Carregamento das camadas ───────────────────────────────
+map.on('load', () => {
+
+    // ── SOURCE: Vector tiles do Martin (via Varnish cache) ──
+    map.addSource('features', {
+        type: 'vector',
+        tiles: [`${TILE_SERVER}/features/{z}/{x}/{y}`],
+        minzoom: 0,
+        maxzoom: 16,
+        attribution: 'WebGIS PostGIS'
+    });
+
+    // ── LAYER: Círculos para pontos ──
+    map.addLayer({
+        id: 'features-circle',
+        type: 'circle',
+        source: 'features',
+        'source-layer': 'features',
+        filter: ['==', ['geometry-type'], 'Point'],
+        paint: {
+            'circle-radius': [
+                'interpolate', ['linear'], ['zoom'],
+                4, 4,
+                10, 8,
+                16, 12
+            ],
+            'circle-color': [
+                'match', ['get', 'category'],
+                'capital', '#FFD700',
+                'cidade',  '#e94560',
+                '#53d8fb'  // default
+            ],
+            'circle-stroke-color': 'white',
+            'circle-stroke-width': 1.5,
+            'circle-opacity': 0.9
+        }
+    });
+
+    // ── LAYER: Labels ──
+    map.addLayer({
+        id: 'features-label',
+        type: 'symbol',
+        source: 'features',
+        'source-layer': 'features',
+        minzoom: 6,
+        layout: {
+            'text-field': ['get', 'name'],
+            'text-size': 12,
+            'text-offset': [0, 1.5],
+            'text-anchor': 'top',
+            'text-font': ['Open Sans Regular']
+        },
+        paint: {
+            'text-color': '#ffffff',
+            'text-halo-color': '#16213e',
+            'text-halo-width': 1.5
+        }
+    });
+
+    // ── LAYER: Polígonos ──
+    map.addLayer({
+        id: 'features-fill',
+        type: 'fill',
+        source: 'features',
+        'source-layer': 'features',
+        filter: ['==', ['geometry-type'], 'Polygon'],
+        paint: {
+            'fill-color': '#e94560',
+            'fill-opacity': 0.2
+        }
+    });
+
+    map.addLayer({
+        id: 'features-outline',
+        type: 'line',
+        source: 'features',
+        'source-layer': 'features',
+        filter: ['in', ['geometry-type'], ['literal', ['Polygon', 'MultiPolygon', 'LineString']]],
+        paint: {
+            'line-color': '#e94560',
+            'line-width': 1.5
+        }
+    });
+
+    // ── Oculta loading ──
+    setTimeout(() => {
+        document.getElementById('loading').classList.add('hidden');
+    }, 500);
+
+    document.getElementById('cache-status').textContent = 'Varnish ativo';
+});
+
+// ── Popup ao clicar em feature ─────────────────────────────
+const popup = new maplibregl.Popup({
+    closeButton: true,
+    closeOnClick: false,
+    maxWidth: '280px'
+});
+
+map.on('click', 'features-circle', (e) => {
+    const props = e.features[0].properties;
+    const coords = e.features[0].geometry.coordinates.slice();
+
+    let propsHtml = '';
+    Object.entries(props).forEach(([k, v]) => {
+        if (k !== 'geom') {
+            const val = typeof v === 'object' ? JSON.stringify(v) : v;
+            propsHtml += `<tr><td>${k}</td><td><strong>${val}</strong></td></tr>`;
+        }
+    });
+
+    popup.setLngLat(coords)
+        .setHTML(`
+            <h3>${props.name || 'Feature'}</h3>
+            <table>${propsHtml}</table>
+        `)
+        .addTo(map);
+});
+
+map.on('mouseenter', 'features-circle', () => {
+    map.getCanvas().style.cursor = 'pointer';
+});
+
+map.on('mouseleave', 'features-circle', () => {
+    map.getCanvas().style.cursor = '';
+});
+
+// ── Atualiza badge de zoom ─────────────────────────────────
+map.on('zoom', () => {
+    document.getElementById('zoom-badge').textContent =
+        `Zoom: ${map.getZoom().toFixed(1)}`;
+});
+
+// ── Contagem de features visíveis ─────────────────────────
+map.on('idle', () => {
+    if (!map.getLayer('features-circle')) return;
+    const features = map.queryRenderedFeatures({ layers: ['features-circle', 'features-fill'] });
+    document.getElementById('feature-count').textContent =
+        features.length > 0 ? features.length.toLocaleString('pt-BR') : '0';
+});
+
+// ── Controles de camadas (toggles) ────────────────────────
+document.getElementById('toggle-features').addEventListener('change', (e) => {
+    const vis = e.target.checked ? 'visible' : 'none';
+    ['features-circle', 'features-label', 'features-fill', 'features-outline'].forEach(id => {
+        if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', vis);
+    });
+});
+</script>
+
+</body>
+</html>

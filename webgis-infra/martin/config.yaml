@@ -1,0 +1,98 @@
+# ============================================================
+# Martin Tile Server v0.14 — Configuração WebGIS
+# Rust, projeto MapLibre — melhor performance bruta
+# Suporte nativo a PMTiles/MBTiles + ST_AsMVT() do PostGIS
+# ============================================================
+
+# Endereço de escuta (interno — Varnish faz proxy)
+listen_addresses: "0.0.0.0:3000"
+
+# Worker threads (= número de vCPUs)
+worker_processes: 4
+
+# ── BANCO DE DADOS ─────────────────────────────────────────
+# Conecta via PgBouncer para connection pooling eficiente
+postgres:
+  # Sobrescrito pela variável de ambiente DATABASE_URL
+  # connection_string: "postgresql://webgis:senha@pgbouncer:5432/webgis"
+
+  # Pool de conexões do Martin para o PgBouncer
+  pool_size: 10
+
+  # Timeout de query (ms) — queries GIS podem demorar mais
+  query_timeout: 30000
+
+  # Auto-descoberta de tabelas com coluna de geometria
+  auto_publish:
+    tables:
+      # Incluir tabelas do schema 'gis'
+      from_schemas:
+        - gis
+      # Ou incluir tabelas específicas:
+      # id_columns: [id]
+
+    # View materializada de tiles otimizados
+    # Martin auto-descobre colunas de geometria
+    views:
+      from_schemas:
+        - gis
+
+# ── TABELAS PUBLICADAS MANUALMENTE ─────────────────────────
+# Controle fino sobre quais tabelas viram endpoints de tiles
+tables:
+  features:
+    schema: gis
+    table: features
+    srid: 4326
+    geometry_column: geom
+    id_column: id
+    # Propriedades expostas no tile (reduz tamanho)
+    properties:
+      - name
+      - category
+      - properties
+
+  tiles_cache:
+    schema: gis
+    table: tiles_cache
+    srid: 4326
+    geometry_column: geom
+    id_column: id
+    properties:
+      - name
+      - category
+      - properties
+
+# ── FUNÇÕES SQL COMO ENDPOINTS ────────────────────────────
+# Para queries espaciais customizadas por zoom/bbox
+functions:
+  features_by_zoom:
+    schema: gis
+    function: get_features_by_zoom
+    # A função deve aceitar (z, x, y, query_params JSONB)
+
+# ── PMTILES (dados estáticos) ─────────────────────────────
+# Sirva arquivos PMTiles diretamente via HTTP Range Requests
+# Custo: ~US$11/mês no Cloudflare R2 para 10M requests
+# mbtiles:
+#   brasil_base:
+#     path: /data/brasil_base.pmtiles
+
+# ── CORS ──────────────────────────────────────────────────
+# Necessário para MapLibre GL JS no browser
+cors:
+  allowed_origins:
+    - "*"    # Em produção, restringir ao seu domínio
+
+# ── CACHE (L1 interno do Martin) ──────────────────────────
+# Varnish faz o cache principal; Martin mantém cache menor
+cache_size_mb: 128
+
+# ── SPRITE E GLYPHS (opcional) ────────────────────────────
+# Para servir ícones e fontes junto com os tiles
+# sprite: /data/sprites
+# font: /data/fonts
+
+# ── HEALTH CHECK ──────────────────────────────────────────
+# GET /health → {"status": "ok"}
+# GET /catalog → lista todos os layers disponíveis

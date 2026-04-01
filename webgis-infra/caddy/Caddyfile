@@ -1,0 +1,100 @@
+# ============================================================
+# Caddyfile — Reverse Proxy WebGIS
+# HTTPS automático via Let's Encrypt/ZeroSSL
+# Substitui Nginx com vantagem significativa: config 3 linhas
+# ============================================================
+
+# ── GLOBAL ────────────────────────────────────────────────
+{
+    # Email para notificações de certificado
+    email {$LETSENCRYPT_EMAIL:webmaster@example.com}
+
+    # HTTP/3 (QUIC) habilitado por padrão no Caddy 2
+    # Reduz latência para usuários brasileiros
+
+    # Log estruturado
+    log {
+        output file /var/log/caddy/access.log {
+            roll_size 100mb
+            roll_keep 5
+        }
+        format json
+        level INFO
+    }
+}
+
+# ── APLICAÇÃO PRINCIPAL ───────────────────────────────────
+{$DOMAIN:localhost} {
+
+    # ── Compressão ────────────────────────────────────────
+    encode gzip zstd
+
+    # ── Headers de segurança ──────────────────────────────
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "geolocation=(*)"  # WebGIS precisa de geolocalização
+        -Server  # Remove header Server
+    }
+
+    # ── Tiles via Varnish Cache ────────────────────────────
+    # Cloudflare → Caddy → Varnish → Martin → PostGIS
+    handle /tiles/* {
+        reverse_proxy varnish:80 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # ── Catalog e Health do Martin (direto, sem cache) ────
+    handle /catalog {
+        reverse_proxy martin:3000
+    }
+
+    handle /health {
+        respond "OK" 200
+    }
+
+    # ── Monitoramento: Uptime Kuma (protegido por IP) ─────
+    handle /monitor/* {
+        # Em produção: restringir por IP ou básica auth
+        basicauth {
+            {$MONITOR_USER:admin} {$MONITOR_PASS_HASH:JDJhJDE0JHBMc2VlM3pIa3BQOFV3cjBpdzVPSHVDdFVFSjVHbFZBZmtJeXJwL2IyRE1RaUo3eVV3ZkNX}
+        }
+        reverse_proxy uptime-kuma:3001
+    }
+
+    # ── Netdata (métricas, protegido) ─────────────────────
+    handle /netdata/* {
+        basicauth {
+            {$MONITOR_USER:admin} {$MONITOR_PASS_HASH:JDJhJDE0JHBMc2VlM3pIa3BQOFV3cjBpdzVPSHVDdFVFSjVHbFZBZmtJeXJwL2IyRE1RaUo3eVV3ZkNX}
+        }
+        uri strip_prefix /netdata
+        reverse_proxy netdata:19999
+    }
+
+    # ── App principal (SPA / API) ─────────────────────────
+    handle /* {
+        reverse_proxy app:80 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+
+            # Health check do upstream
+            health_uri /
+            health_interval 30s
+            health_timeout 5s
+        }
+    }
+
+    # ── Rate limiting para proteção da API ────────────────
+    # (Cloudflare também faz rate limiting na frente)
+    # Para rate limiting avançado, use o módulo caddy-ratelimit
+}
+
+# ── REDIRECT HTTP → HTTPS ────────────────────────────────
+# Caddy faz isso automaticamente — não precisa de config extra

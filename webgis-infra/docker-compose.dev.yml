@@ -1,0 +1,149 @@
+# ============================================================
+# docker-compose.dev.yml — Preview local (sem HTTPS/Cloudflare)
+# Uso: docker compose -f docker-compose.dev.yml up -d
+#
+# Portas expostas localmente:
+#   http://localhost       → App frontend (MapLibre GL JS)
+#   http://localhost:3000  → Martin tile server direto
+#   http://localhost:6081  → Varnish (cache tiles)
+#   http://localhost:3001  → Uptime Kuma (monitoramento)
+#   http://localhost:19999 → Netdata (métricas)
+#   localhost:5433         → PostgreSQL/PostGIS (psql/DBeaver)
+# ============================================================
+
+version: "3.9"
+
+networks:
+  webgis_net:
+    driver: bridge
+
+volumes:
+  postgis_data:
+  uptime_kuma_data:
+
+services:
+
+  # ── PostGIS ───────────────────────────────────────────────
+  postgis:
+    image: postgis/postgis:16-3.4
+    container_name: webgis_postgis
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-webgis}
+      POSTGRES_USER: ${POSTGRES_USER:-webgis}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-webgis_local_2026}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgis_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
+    ports:
+      - "5433:5432"   # Porta 5433 para não conflitar com Postgres local
+    networks:
+      - webgis_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-webgis} -d ${POSTGRES_DB:-webgis}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── PgBouncer ─────────────────────────────────────────────
+  pgbouncer:
+    image: bitnami/pgbouncer:1.22.1
+    container_name: webgis_pgbouncer
+    restart: unless-stopped
+    environment:
+      POSTGRESQL_HOST: postgis
+      POSTGRESQL_PORT: 5432
+      POSTGRESQL_DATABASE: ${POSTGRES_DB:-webgis}
+      POSTGRESQL_USERNAME: ${POSTGRES_USER:-webgis}
+      POSTGRESQL_PASSWORD: ${POSTGRES_PASSWORD:-webgis_local_2026}
+      PGBOUNCER_DATABASE: ${POSTGRES_DB:-webgis}
+      PGBOUNCER_POOL_MODE: transaction
+      PGBOUNCER_DEFAULT_POOL_SIZE: 30
+      PGBOUNCER_MAX_CLIENT_CONN: 200
+      PGBOUNCER_IGNORE_STARTUP_PARAMETERS: extra_float_digits
+    networks:
+      - webgis_net
+    depends_on:
+      postgis:
+        condition: service_healthy
+
+  # ── Martin tile server ────────────────────────────────────
+  martin:
+    image: ghcr.io/maplibre/martin:v0.14.3
+    container_name: webgis_martin
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-webgis}:${POSTGRES_PASSWORD:-webgis_local_2026}@pgbouncer:5432/${POSTGRES_DB:-webgis}
+    volumes:
+      - ./martin/config.yaml:/config.yaml:ro
+    command: --config /config.yaml
+    ports:
+      - "3000:3000"
+    networks:
+      - webgis_net
+    depends_on:
+      - pgbouncer
+
+  # ── Varnish cache ─────────────────────────────────────────
+  varnish:
+    image: varnish:7.5
+    container_name: webgis_varnish
+    restart: unless-stopped
+    volumes:
+      - ./varnish/default.vcl:/etc/varnish/default.vcl:ro
+    environment:
+      VARNISH_SIZE: 256m
+    command: -F -f /etc/varnish/default.vcl -s malloc,256m
+    ports:
+      - "6081:80"
+    networks:
+      - webgis_net
+    depends_on:
+      - martin
+
+  # ── App frontend ──────────────────────────────────────────
+  app:
+    image: nginx:alpine
+    container_name: webgis_app
+    restart: unless-stopped
+    volumes:
+      - ./app:/usr/share/nginx/html:ro
+    ports:
+      - "80:80"
+    networks:
+      - webgis_net
+
+  # ── Uptime Kuma ───────────────────────────────────────────
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: webgis_uptime_kuma
+    restart: unless-stopped
+    volumes:
+      - uptime_kuma_data:/app/data
+    ports:
+      - "3001:3001"
+    networks:
+      - webgis_net
+
+  # ── Netdata ───────────────────────────────────────────────
+  netdata:
+    image: netdata/netdata:stable
+    container_name: webgis_netdata
+    restart: unless-stopped
+    pid: host
+    cap_add:
+      - SYS_PTRACE
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "19999:19999"
+    networks:
+      - webgis_net
